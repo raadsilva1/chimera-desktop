@@ -1,0 +1,2163 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PREFIX=${PREFIX:-/usr/local}
+WORKDIR=${WORKDIR:-"${HOME}/src/chimera-xdm-afterstep"}
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}
+
+AFTERSTEP_JOBS=${AFTERSTEP_JOBS:-1}
+CLEAN_AFTERSTEP=${CLEAN_AFTERSTEP:-1}
+
+START_XDM=${START_XDM:-0}
+TRACE=${TRACE:-0}
+DISPLAY_MANAGER=${DISPLAY_MANAGER:-xdm}
+
+APK_TIMEOUT=${APK_TIMEOUT:-240}
+APK_NET_TIMEOUT=${APK_NET_TIMEOUT:-30}
+GIT_TIMEOUT=${GIT_TIMEOUT:-300}
+XDM_CPP_WRAPPER=${XDM_CPP_WRAPPER:-"${WORKDIR}/xdm-cpp-wrapper"}
+XDM_TOOLKIT_FALLBACK=${XDM_TOOLKIT_FALLBACK:-1}
+LIBXAW_REPO=${LIBXAW_REPO:-https://gitlab.freedesktop.org/xorg/lib/libXaw.git}
+LIBXAW_REPO_FALLBACK=${LIBXAW_REPO_FALLBACK:-https://github.com/freedesktop-unofficial-mirror/xorg__lib__libXaw.git}
+BUILD_LIBXAW_IF_MISSING=${BUILD_LIBXAW_IF_MISSING:-1}
+XDM_SKIP_CHOOSER_IF_NO_XAW=${XDM_SKIP_CHOOSER_IF_NO_XAW:-1}
+DINIT_SERVICE_DIR=${DINIT_SERVICE_DIR:-/etc/dinit.d}
+DINIT_BOOT_DIR=${DINIT_BOOT_DIR:-/etc/dinit.d/boot.d}
+DINIT_XDM_SERVICE=${DINIT_XDM_SERVICE:-xdm}
+DINIT_ESXDM_SERVICE=${DINIT_ESXDM_SERVICE:-esxdm}
+DINIT_START_XDM_AFTER_ENABLE=${DINIT_START_XDM_AFTER_ENABLE:-0}
+ESXDM_PAM_DIR=${ESXDM_PAM_DIR:-/usr/lib/pam.d}
+
+AFTERSTEP_REPO=${AFTERSTEP_REPO:-https://github.com/afterstep/afterstep.git}
+XDM_REPO=${XDM_REPO:-https://gitlab.freedesktop.org/xorg/app/xdm.git}
+XDM_REPO_FALLBACK=${XDM_REPO_FALLBACK:-https://github.com/freedesktop-unofficial-mirror/xorg__app__xdm.git}
+ESXDM_REPO=${ESXDM_REPO:-https://github.com/raadsilva1/chimera-esdxm.git}
+ESXDM_REPO_FALLBACK=${ESXDM_REPO_FALLBACK:-}
+
+USERNAME=
+KEYBOARD_LAYOUT=
+LOGFILE=
+
+declare -a AS_ROOT=()
+
+timestamp(){ date '+%Y-%m-%d %H:%M:%S'; }
+log(){ printf '[%s] [+] %s\n' "$(timestamp)" "$*"; }
+warn(){ printf '[%s] [!] %s\n' "$(timestamp)" "$*" >&2; }
+die(){ printf '[%s] [x] %s\n' "$(timestamp)" "$*" >&2; exit 1; }
+
+trap 'rc=$?; warn "failed with rc=$rc at line ${LINENO}: ${BASH_COMMAND}"; exit "$rc"' ERR
+
+usage(){
+  cat <<EOF
+Usage: $0 [-u username] [-y keyboard_layout] [-o xdm|esxdm] [-v] [-h]
+
+Options:
+  -u <username>          Configure AfterStep .xsession for an existing user
+  -y <keyboard layout>   Configure Xorg keyboard layout, e.g. us, br, de, br,us
+  -o <xdm|esxdm>         Display manager to build/configure; default: xdm
+  -v                     Enable shell xtrace
+  -h                     Show this help
+
+Environment:
+  PREFIX=/usr/local      Install prefix
+  WORKDIR=~/src/...      Build directory
+  JOBS=N                 Parallel build jobs for xdm and other builds
+  AFTERSTEP_JOBS=1       Parallel jobs for AfterStep; default is 1 for reliability
+  CLEAN_AFTERSTEP=1      Clean partial AfterStep build before rebuilding
+  START_XDM=1            Start selected display manager immediately after install
+  DISPLAY_MANAGER=xdm     Default display manager; xdm or esxdm
+  APK_TIMEOUT=240        Outer timeout in seconds for each apk operation
+  APK_NET_TIMEOUT=30     apk network timeout in seconds
+  GIT_TIMEOUT=300        Timeout in seconds for git clone/fetch/pull
+  XDM_CPP_WRAPPER=...    Override path for xdm cpp wrapper
+  XDM_TOOLKIT_FALLBACK=1 Enable xdm Xaw toolkit fallback when xaw7.pc is absent
+  BUILD_LIBXAW_IF_MISSING=1 Build libXaw from source if Xaw headers are absent
+  XDM_SKIP_CHOOSER_IF_NO_XAW=1 Skip xdm chooser if Xaw headers still cannot be provided
+  DINIT_SERVICE_DIR=/etc/dinit.d Directory for local system dinit service files
+  DINIT_BOOT_DIR=/etc/dinit.d/boot.d Directory for enabled boot symlinks
+  DINIT_XDM_SERVICE=xdm Service name to install/enable for xdm
+  DINIT_ESXDM_SERVICE=esxdm Service name to install/enable for esxdm
+  ESXDM_PAM_DIR=/usr/lib/pam.d PAM config directory for esxdm
+  ESXDM_REPO=...        Override esxdm source repository
+  DINIT_START_XDM_AFTER_ENABLE=1 Start xdm after enabling, independent of START_XDM
+  LIBXAW_REPO=...       Override libXaw source repository
+  TRACE=1                Same as -v
+EOF
+}
+
+parse_args(){
+  while getopts ":u:y:o:vh" opt; do
+    case "$opt" in
+      u) USERNAME=$OPTARG ;;
+      y) KEYBOARD_LAYOUT=$OPTARG ;;
+      o) DISPLAY_MANAGER=$OPTARG ;;
+      v) TRACE=1 ;;
+      h) usage; exit 0 ;;
+      :) die "option -$OPTARG requires an argument" ;;
+      \?) die "unknown option: -$OPTARG" ;;
+    esac
+  done
+
+  if [ -n "$USERNAME" ] && ! getent passwd "$USERNAME" >/dev/null 2>&1; then
+    die "user does not exist: $USERNAME"
+  fi
+
+  if [ -n "$KEYBOARD_LAYOUT" ]; then
+    case "$KEYBOARD_LAYOUT" in
+      *[!A-Za-z0-9_,.-]*)
+        die "invalid keyboard layout: $KEYBOARD_LAYOUT"
+        ;;
+    esac
+  fi
+
+  case "$DISPLAY_MANAGER" in
+    xdm|esxdm) ;;
+    *) die "invalid display manager for -o: $DISPLAY_MANAGER (expected xdm or esxdm)" ;;
+  esac
+}
+
+init_logging(){
+  mkdir -p "$WORKDIR"
+  LOGFILE=${LOGFILE:-"${WORKDIR}/install-$(date '+%Y%m%d-%H%M%S').log"}
+
+  if command -v tee >/dev/null 2>&1; then
+    exec > >(tee -a "$LOGFILE") 2>&1
+  fi
+
+  log "log file: $LOGFILE"
+
+  if [ "$TRACE" = 1 ]; then
+    PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+    set -x
+  fi
+}
+
+quote_cmd(){
+  local arg
+  for arg in "$@"; do
+    printf '%q ' "$arg"
+  done
+}
+
+stage(){
+  printf '\n'
+  log "==== $* ===="
+}
+
+detect_os(){
+  stage "detecting OS"
+
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    log "os-release ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
+    [ "${ID:-}" = chimera ] || warn "this does not look like Chimera Linux: ID=${ID:-unknown}"
+  else
+    warn "/etc/os-release not found; continuing anyway"
+  fi
+}
+
+setup_privilege(){
+  stage "checking privilege method"
+
+  if [ "$(id -u)" -eq 0 ]; then
+    AS_ROOT=()
+    log "running as root"
+  elif command -v doas >/dev/null 2>&1; then
+    AS_ROOT=(doas)
+    log "using doas"
+  elif command -v sudo >/dev/null 2>&1; then
+    AS_ROOT=(sudo)
+    log "using sudo"
+  else
+    die "run as root, or install/configure doas or sudo"
+  fi
+
+  root true || die "privilege check failed"
+}
+
+root(){
+  if [ "${#AS_ROOT[@]}" -eq 0 ]; then
+    "$@"
+  else
+    "${AS_ROOT[@]}" "$@"
+  fi
+}
+
+run_timeout(){
+  local seconds=$1
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  else
+    warn "timeout command not found; running without timeout: $(quote_cmd "$@")"
+    "$@"
+  fi
+}
+
+run_cmd(){
+  log "run: $(quote_cmd "$@")"
+  "$@"
+}
+
+run_timed(){
+  local seconds=$1
+  shift
+  log "run timeout=${seconds}s: $(quote_cmd "$@")"
+  run_timeout "$seconds" "$@"
+}
+
+run_root_cmd(){
+  log "root: $(quote_cmd "$@")"
+  root "$@"
+}
+
+run_root_timed(){
+  local seconds=$1
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    if [ "${#AS_ROOT[@]}" -eq 0 ]; then
+      log "root timeout=${seconds}s: $(quote_cmd "$@")"
+      timeout "$seconds" "$@"
+    else
+      log "root timeout=${seconds}s: $(quote_cmd "${AS_ROOT[@]}" "$@")"
+      timeout "$seconds" "${AS_ROOT[@]}" "$@"
+    fi
+  else
+    warn "timeout command not found; running privileged command without timeout"
+    run_root_cmd "$@"
+  fi
+}
+
+apk_cmd(){
+  run_root_timed "$APK_TIMEOUT" \
+    apk \
+      --interactive=no \
+      --progress=no \
+      --timeout="$APK_NET_TIMEOUT" \
+      "$@"
+}
+
+print_apk_repo_state(){
+  stage "apk repository state"
+
+  local found=0
+  local path
+
+  for path in \
+    /etc/apk/repositories \
+    /etc/apk/repositories.d/*.list \
+    /usr/lib/apk/repositories \
+    /usr/lib/apk/repositories.d/*.list
+  do
+    [ -e "$path" ] || continue
+    found=1
+    log "repo/config file: $path"
+    sed 's/^/    /' "$path" || true
+  done
+
+  if [ "$found" = 0 ]; then
+    warn "no visible apk repository files found in /etc/apk or /usr/lib/apk"
+    warn "continuing anyway; apk update will decide whether repositories are configured"
+  fi
+
+  if command -v apk >/dev/null 2>&1; then
+    apk info 2>/dev/null | grep '^chimera-repo' || warn "no installed chimera-repo packages shown by apk info"
+  fi
+}
+
+apk_update_indexes(){
+  stage "refreshing apk indexes"
+
+  print_apk_repo_state
+
+  log "apk timeout=${APK_TIMEOUT}s net-timeout=${APK_NET_TIMEOUT}s"
+
+  if ! apk_cmd update; then
+    cat >&2 <<EOF
+[x] apk update failed or timed out.
+
+Try manually:
+    apk --interactive=no --progress=no --timeout=$APK_NET_TIMEOUT update
+
+Inspect:
+    apk info | grep '^chimera-repo'
+    find /etc/apk /usr/lib/apk -maxdepth 3 -type f -print
+    cat /etc/apk/config 2>/dev/null
+    cat /usr/lib/apk/config 2>/dev/null
+
+To set a mirror override:
+    mkdir -p /etc/apk/repositories.d
+    echo 'set CHIMERA_REPO_URL=https://repo.chimera-linux.org' > /etc/apk/repositories.d/00-custom.list
+
+Log:
+    $LOGFILE
+EOF
+    exit 1
+  fi
+}
+
+apk_add_list(){
+  local mode=$1
+  local label=$2
+  shift 2
+
+  local -a pkgs=("$@")
+  [ "${#pkgs[@]}" -gt 0 ] || return 0
+
+  stage "apk add ${mode}: ${label}"
+  log "package set: ${pkgs[*]}"
+
+  if apk_cmd add "${pkgs[@]}"; then
+    log "installed package set: $label"
+    return 0
+  fi
+
+  warn "batch install failed for: $label"
+  warn "falling back to individual packages"
+
+  local rc=0
+  local pkg
+
+  for pkg in "${pkgs[@]}"; do
+    log "trying package: $pkg"
+
+    if apk_cmd add "$pkg"; then
+      log "installed: $pkg"
+    else
+      if [ "$mode" = required ]; then
+        warn "required package failed: $pkg"
+        rc=1
+      else
+        warn "optional package skipped: $pkg"
+      fi
+    fi
+  done
+
+  if [ "$mode" = required ] && [ "$rc" -ne 0 ]; then
+    die "one or more required packages failed for group: $label"
+  fi
+}
+
+apk_add_any_required(){
+  local label=$1
+  shift
+
+  local pkg
+
+  stage "apk add required alternative: $label"
+  log "candidates: $*"
+
+  for pkg in "$@"; do
+    log "trying alternative: $pkg"
+
+    if apk_cmd add "$pkg"; then
+      log "installed alternative for $label: $pkg"
+      return 0
+    fi
+
+    warn "failed alternative: $pkg"
+  done
+
+  die "no candidate worked for required dependency: $label"
+}
+
+apk_add_any_optional(){
+  local label=$1
+  shift
+
+  local pkg
+
+  stage "apk add optional alternative: $label"
+  log "candidates: $*"
+
+  for pkg in "$@"; do
+    log "trying optional alternative: $pkg"
+
+    if apk_cmd add "$pkg"; then
+      log "installed optional alternative for $label: $pkg"
+      return 0
+    fi
+
+    warn "failed optional alternative: $pkg"
+  done
+
+  warn "no candidate worked for optional dependency: $label"
+}
+
+apk_add_pc_optional(){
+  local label=$1
+  shift
+
+  local -a pkgs=()
+  local pc
+
+  for pc in "$@"; do
+    pkgs+=("pc:$pc")
+  done
+
+  apk_add_list optional "$label" "${pkgs[@]}"
+}
+
+pkgconf_cmd(){
+  if command -v pkg-config >/dev/null 2>&1; then
+    command -v pkg-config
+  elif command -v pkgconf >/dev/null 2>&1; then
+    command -v pkgconf
+  else
+    return 1
+  fi
+}
+
+show_pkg_config_status(){
+  stage "pkg-config status"
+
+  local pc cmd
+  cmd=$(pkgconf_cmd) || {
+    warn "pkg-config/pkgconf not available yet"
+    return 0
+  }
+
+  for pc in "$@"; do
+    if "$cmd" --exists "$pc" >/dev/null 2>&1; then
+      log "pc:$pc -> $("$cmd" --modversion "$pc" 2>/dev/null || printf found)"
+    else
+      warn "pc:$pc not found"
+    fi
+  done
+}
+
+require_command(){
+  local cmd=$1
+  command -v "$cmd" >/dev/null 2>&1 || die "required command missing after dependency install: $cmd"
+  log "found command: $cmd -> $(command -v "$cmd")"
+}
+
+install_deps(){
+  stage "installing dependencies"
+
+  command -v apk >/dev/null 2>&1 || die "apk not found"
+
+  apk_update_indexes
+
+  apk_add_list required "base development tools" \
+    base-devel
+
+  apk_add_any_required "git" \
+    cmd:git git
+
+  apk_add_any_required "pkg-config/pkgconf" \
+    cmd:pkg-config cmd:pkgconf pkgconf
+
+  apk_add_any_optional "standalone cpp command" \
+    cmd:cpp cpp
+
+  apk_add_any_required "autoreconf/autoconf" \
+    cmd:autoreconf autoconf
+
+  apk_add_any_required "automake" \
+    cmd:automake automake
+
+  apk_add_any_required "libtool" \
+    cmd:libtoolize cmd:libtool libtool
+
+  apk_add_any_required "perl" \
+    cmd:perl perl
+
+  apk_add_any_required "GNU make or make" \
+    cmd:gmake gmake cmd:make make
+
+  apk_add_any_required "Xorg build macros" \
+    xorg-macros pc:xorg-macros util-macros xorg-util-macros
+
+  apk_add_list required "Xorg server" \
+    xserver-xorg
+
+  apk_add_list optional "Xorg client utilities" \
+    cmd:startx \
+    cmd:xterm \
+    cmd:xrdb \
+    cmd:xauth \
+    cmd:sessreg \
+    cmd:setxkbmap
+
+  apk_add_list optional "Xorg fonts and keyboard data" \
+    fonts-xorg \
+    font-misc-misc \
+    font-cursor-misc \
+    xkeyboard-config
+
+  apk_add_list optional "seat, login, dbus" \
+    dbus \
+    elogind \
+    seatd
+
+  apk_add_list optional "PipeWire multimedia stack" \
+    pipewire \
+    wireplumber \
+    pipewire-pulse \
+    alsa-ucm-conf
+
+  apk_add_pc_optional "core X11 pkg-config providers" \
+    x11 \
+    xau \
+    xdmcp \
+    xext \
+    xt
+
+  apk_add_pc_optional "legacy X11 toolkit pkg-config providers" \
+    xmu \
+    xaw \
+    xaw7 \
+    xaw6 \
+    xpm
+
+  apk_add_pc_optional "optional X11/image/font/pkg-config providers" \
+    xproto \
+    xtrans \
+    xinerama \
+    xft \
+    xrender \
+    xcursor \
+    xrandr \
+    sm \
+    ice \
+    freetype2 \
+    fontconfig \
+    libpng \
+    libjpeg
+
+  apk_add_list optional "likely X11 library package names" \
+    libx11 \
+    libxau \
+    libxdmcp \
+    libxext \
+    libxmu \
+    libxaw \
+    libxt \
+    libxpm \
+    libxrender \
+    libxft \
+    libxinerama \
+    libxcursor \
+    libxrandr \
+    libsm \
+    libice \
+    freetype \
+    fontconfig \
+    libpng \
+    libjpeg-turbo
+
+  apk_add_list optional "graphics runtime" \
+    mesa \
+    libdrm \
+    firmware-linux \
+    linux-firmware
+
+
+  if [ "$DISPLAY_MANAGER" = esxdm ]; then
+    apk_add_any_required "C++ compiler for esxdm"       cmd:c++       cmd:clang++       clang       cxx
+
+    apk_add_any_optional "PAM for esxdm"       pam       linux-pam       libpam
+
+    apk_add_pc_optional "esxdm Xft/fontconfig pkg-config providers"       xft       fontconfig
+
+    apk_add_list optional "likely esxdm library/header package names"       libxft       fontconfig       pam       linux-pam       libpam
+  fi
+
+  require_command git
+  require_command autoreconf
+  require_command automake
+  require_command perl
+
+  if command -v gmake >/dev/null 2>&1; then
+    log "GNU make command: gmake"
+  else
+    require_command make
+    warn "gmake not found; using make"
+  fi
+
+  if command -v pkg-config >/dev/null 2>&1; then
+    log "pkg-config command: $(command -v pkg-config)"
+  elif command -v pkgconf >/dev/null 2>&1; then
+    log "pkgconf command: $(command -v pkgconf)"
+  else
+    die "neither pkg-config nor pkgconf found"
+  fi
+
+  show_pkg_config_status \
+    x11 \
+    xau \
+    xdmcp \
+    xext \
+    xmu \
+    xaw \
+    xaw7 \
+    xt \
+    xpm \
+    xrender \
+    xft \
+    fontconfig \
+    freetype2
+}
+
+make_cmd(){
+  if command -v gmake >/dev/null 2>&1; then
+    printf '%s\n' gmake
+  else
+    printf '%s\n' make
+  fi
+}
+
+first_command(){
+  local cmd
+  for cmd in "$@"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      command -v "$cmd"
+      return 0
+    fi
+  done
+  return 1
+}
+
+clone_or_update(){
+  local name=$1
+  local repo=$2
+  local fallback=${3:-}
+  local dir="${WORKDIR}/${name}"
+
+  stage "source checkout: $name"
+
+  mkdir -p "$WORKDIR"
+
+  if [ -d "${dir}/.git" ]; then
+    log "updating existing checkout: $dir"
+
+    if ! run_timed "$GIT_TIMEOUT" git -C "$dir" fetch --all --prune; then
+      warn "$name: fetch failed; using existing checkout"
+      return 0
+    fi
+
+    if ! run_timed "$GIT_TIMEOUT" git -C "$dir" pull --ff-only; then
+      warn "$name: pull failed; using existing checkout"
+    fi
+
+    return 0
+  fi
+
+  log "cloning: $repo -> $dir"
+
+  if run_timed "$GIT_TIMEOUT" git clone --depth=1 "$repo" "$dir"; then
+    return 0
+  fi
+
+  [ -n "$fallback" ] || die "clone failed: $repo"
+
+  warn "primary clone failed; trying fallback mirror"
+  run_timed "$GIT_TIMEOUT" git clone --depth=1 "$fallback" "$dir"
+}
+
+patch_afterstep_for_chimera(){
+  stage "patching AfterStep for Chimera/LLVM"
+
+  local dir="${WORKDIR}/afterstep"
+  local f tmp
+
+  [ -d "$dir" ] || {
+    warn "AfterStep checkout not found: $dir"
+    return 0
+  }
+
+  f="${dir}/libAfterBase/selfdiag.c"
+
+  if [ -f "$f" ]; then
+    if grep -q 'chimera_dynamic_decl_patch' "$f"; then
+      log "AfterStep _DYNAMIC patch already applied"
+    elif grep -q '_DYNAMIC' "$f"; then
+      tmp=$(mktemp)
+
+      awk '
+        {
+          print
+          if (!done && $0 ~ /^[[:space:]]*#[[:space:]]*include[[:space:]]+<elf\.h>/) {
+            print ""
+            print "/* chimera_dynamic_decl_patch:"
+            print " * Chimera/LLVM/musl may not declare _DYNAMIC in headers."
+            print " * The symbol is provided by the dynamic linker; declare it before use."
+            print " */"
+            print "#if defined(ElfW)"
+            print "extern ElfW(Dyn) _DYNAMIC[];"
+            print "#endif"
+            done=1
+          }
+        }
+      ' "$f" > "$tmp"
+
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+
+      log "patched AfterStep selfdiag.c for _DYNAMIC declaration"
+    else
+      warn "AfterStep selfdiag.c does not reference _DYNAMIC; skipping that patch"
+    fi
+  else
+    warn "AfterStep selfdiag.c not found: $f"
+  fi
+
+  # Patch 2: modern C compilers need XkbKeycodeToKeysym declared.
+  # Self-healing: do not trust an old chimera_xkb_decl_patch marker,
+  # because an earlier script version may have inserted it too late.
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+
+    if head -n 80 "$f" | grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]+<X11/XKBlib\.h>'; then
+      log "AfterStep XKB include already near top: $f"
+      continue
+    fi
+
+    log "ensuring XKB declaration include near top in: $f"
+
+    tmp=$(mktemp)
+
+    {
+      printf '%s\n' '#include <X11/XKBlib.h> /* chimera_xkb_decl_patch_top */'
+      cat "$f"
+    } > "$tmp"
+
+    cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+    mv "$tmp" "$f"
+  done < <(
+    find "$dir" -type f \( -name '*.c' -o -name '*.h' \) -print |
+      while IFS= read -r candidate; do
+        grep -q 'XkbKeycodeToKeysym' "$candidate" && printf '%s\n' "$candidate"
+      done
+  )
+
+  # Patch 3: C99/LLVM inline semantics can leave these helpers undefined
+  # at link time because plain `inline` does not guarantee an emitted symbol.
+  # Keep them translation-unit local so references inside asvector.c resolve.
+  f="${dir}/libAfterBase/asvector.c"
+
+  if [ -f "$f" ]; then
+    if grep -qE '^inline[[:space:]]+void[[:space:]]+(vector_move_data_up|vector_move_data_down|vector_set_data)[[:space:]]*\(' "$f"; then
+      log "patching asvector inline helper linkage in: $f"
+
+      tmp=$(mktemp)
+
+      awk '
+        BEGIN { marked = 0 }
+        {
+          if (!marked && $0 !~ /chimera_asvector_inline_patch/) {
+            print "/* chimera_asvector_inline_patch:"
+            print " * Plain C99 inline may not emit callable symbols with LLVM/musl."
+            print " * Make file-local helper functions static inline."
+            print " */"
+            marked = 1
+          }
+
+          if ($0 ~ /^inline[[:space:]]+void[[:space:]]+vector_move_data_up[[:space:]]*\(/ ||
+              $0 ~ /^inline[[:space:]]+void[[:space:]]+vector_move_data_down[[:space:]]*\(/ ||
+              $0 ~ /^inline[[:space:]]+void[[:space:]]+vector_set_data[[:space:]]*\(/) {
+            sub(/^inline[[:space:]]+void/, "static inline void")
+          }
+
+          print
+        }
+      ' "$f" > "$tmp"
+
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+
+      log "patched asvector.c inline helper linkage"
+    else
+      log "asvector inline helper linkage already patched or not needed"
+    fi
+  else
+    warn "AfterStep asvector.c not found: $f"
+  fi
+
+  # Patch 4: modern C compilers reject implicit declarations for the
+  # asdbus session-manager and suspend/hibernate helpers used by src/afterstep/afterstep.c.
+  #
+  # Self-healing: an earlier script version added an over-broad local
+  # prototype block, including:
+  #
+  #   Bool asdbus_Logout(int mode, int timeout);
+  #
+  # but upstream dbus.c defines:
+  #
+  #   Bool asdbus_Logout(ASDbusLogoutMode mode, int timeout)
+  #
+  # so Clang correctly reports conflicting types. Remove any old local
+  # chimera_asdbus_proto_patch block first, then add only the missing
+  # session-manager and suspend/hibernate prototypes.
+  f="${dir}/src/afterstep/afterstep.c"
+
+  if [ -f "$f" ]; then
+    if grep -q 'asdbus_GetCanHIbernate' "$f"; then
+      log "repairing asdbus_GetCanHIbernate typo in: $f"
+      tmp=$(mktemp)
+      sed 's/asdbus_GetCanHIbernate/asdbus_GetCanHibernate/g' "$f" > "$tmp"
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+    fi
+
+    if grep -q 'chimera_asdbus_proto_patch' "$f"; then
+      log "removing old unsafe asdbus prototype patch from: $f"
+
+      tmp=$(mktemp)
+
+      awk '
+        /chimera_asdbus_proto_patch/ {
+          skipping = 1
+          next
+        }
+
+        skipping {
+          if ($0 ~ /^[[:space:]]*Bool[[:space:]]+asdbus_Hibernate[[:space:]]*\([^;]*\);/) {
+            skipping = 0
+          }
+          next
+        }
+
+        {
+          print
+        }
+      ' "$f" > "$tmp"
+
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+    fi
+
+    if grep -q 'chimera_asdbus_proto_patch_safe' "$f"; then
+      log "AfterStep safe asdbus prototype patch already applied: $f"
+    else
+      log "adding safe asdbus session-manager and suspend/hibernate prototypes to: $f"
+
+      tmp=$(mktemp)
+
+      awk '
+        {
+          print
+          if (!done && $0 ~ /^[[:space:]]*#[[:space:]]*include[[:space:]]+"asinternals\.h"/) {
+            print ""
+            print "/* chimera_asdbus_proto_patch_safe:"
+            print " * Clang/C99 rejects implicit declarations for selected dbus helpers."
+            print " * Keep this minimal to avoid conflicting with upstream declarations such as"
+            print " * asdbus_Logout(ASDbusLogoutMode, int)."
+            print " */"
+            print "void asdbus_UnregisterSMClient(const char *sm_client_path);"
+            print "Bool asdbus_GetCanSuspend(void);"
+            print "Bool asdbus_Suspend(int timeout);"
+            print "Bool asdbus_GetCanHibernate(void);"
+            print "Bool asdbus_Hibernate(int timeout);"
+            done=1
+          }
+        }
+        END {
+          if (!done) {
+            print ""
+            print "/* chimera_asdbus_proto_patch_safe */"
+            print "void asdbus_UnregisterSMClient(const char *sm_client_path);"
+            print "Bool asdbus_GetCanSuspend(void);"
+            print "Bool asdbus_Suspend(int timeout);"
+            print "Bool asdbus_GetCanHibernate(void);"
+            print "Bool asdbus_Hibernate(int timeout);"
+          }
+        }
+      ' "$f" > "$tmp"
+
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+
+      log "patched afterstep.c with safe asdbus session-manager and suspend/hibernate prototypes"
+    fi
+  else
+    warn "AfterStep afterstep.c not found: $f"
+  fi
+  # Patch 5: dbus.c has an old K&R/implicit-int style helper:
+  #
+  #   static _asdbus_add_match(...)
+  #
+  # Modern Clang/C99 rejects that because the return type is missing.
+  # The helper only calls dbus_bus_add_match and logs errors; it returns no value.
+  # Make the type explicit and keep the change idempotent.
+  f="${dir}/src/afterstep/dbus.c"
+
+  if [ -f "$f" ]; then
+    if grep -qE '^[[:space:]]*static[[:space:]]+_asdbus_add_match[[:space:]]*\(' "$f"; then
+      log "patching dbus.c implicit-int helper return type in: $f"
+
+      tmp=$(mktemp)
+
+      awk '
+        BEGIN { marked = 0 }
+        {
+          if ($0 ~ /^[[:space:]]*static[[:space:]]+_asdbus_add_match[[:space:]]*\(/) {
+            if (!marked) {
+              print "/* chimera_dbus_implicit_int_patch:"
+              print " * Clang/C99 rejects implicit int. This helper returns no value."
+              print " */"
+              marked = 1
+            }
+            sub(/static[[:space:]]+_asdbus_add_match/, "static void _asdbus_add_match")
+          }
+          print
+        }
+      ' "$f" > "$tmp"
+
+      cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+      mv "$tmp" "$f"
+
+      log "patched dbus.c _asdbus_add_match return type"
+    else
+      log "dbus.c implicit-int helper return type already patched or not needed"
+    fi
+  else
+    warn "AfterStep dbus.c not found: $f"
+  fi
+
+  # Patch 6: ASDocGen/xmlproc.c can contain a non-ASCII/control-byte
+  # character literal used for NROFF handling. Modern Clang treats that as
+  # "character too large for enclosing character literal type".
+  #
+  # Self-healing: do not trust an old marker. Earlier versions of this script
+  # could add the marker but miss one or more bad literals. Rewrite every
+  # DocType_NROFF line that compares c to a single-quoted character literal.
+  f="${dir}/src/ASDocGen/xmlproc.c"
+
+  if [ -f "$f" ]; then
+    if grep -q 'DocType_NROFF' "$f"; then
+      log "self-healing xmlproc.c non-ASCII control-byte literal comparisons in: $f"
+
+      tmp=$(mktemp)
+
+      awk '
+        BEGIN {
+          patched = 0
+          inserted_marker = 0
+        }
+
+        {
+          line = $0
+
+          if (line ~ /DocType_NROFF/ &&
+              line ~ /state->doc_type/ &&
+              line ~ /c[[:space:]]*==[[:space:]]*\047[^\047]*\047/) {
+            if (!inserted_marker && line !~ /chimera_xmlproc_ctrl_literal_patch/) {
+              print "/* chimera_xmlproc_ctrl_literal_patch:"
+              print " * Clang rejects non-ASCII control-character literals."
+              print " * Compare the intended byte value explicitly instead."
+              print " */"
+              inserted_marker = 1
+            }
+
+            gsub(/c[[:space:]]*==[[:space:]]*\047[^\047]*\047/, "((unsigned char)c) == 0x98", line)
+            patched++
+          }
+
+          print line
+        }
+
+        END {
+          if (patched > 0) {
+            # The shell log below reports success; awk exits normally.
+          }
+        }
+      ' "$f" > "$tmp"
+
+      if cmp -s "$f" "$tmp"; then
+        rm -f "$tmp"
+        log "xmlproc.c control-byte literal patch already effective or not needed"
+      else
+        cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+        mv "$tmp" "$f"
+        log "patched xmlproc.c control-byte literal comparisons"
+      fi
+    else
+      warn "xmlproc.c did not contain DocType_NROFF pattern; skipping control-byte patch"
+    fi
+  else
+    warn "AfterStep xmlproc.c not found: $f"
+  fi
+
+}
+
+clean_afterstep_if_requested(){
+  [ "${CLEAN_AFTERSTEP:-1}" = 1 ] || return 0
+
+  local dir="${WORKDIR}/afterstep"
+  local mk
+  mk=$(make_cmd)
+
+  [ -d "$dir" ] || return 0
+
+  stage "cleaning previous AfterStep partial build"
+
+  cd "$dir"
+  "$mk" clean || true
+}
+
+configure_build_install_with_jobs(){
+  local build_jobs=$1
+  local dir=$2
+  shift 2
+
+  local mk
+  mk=$(make_cmd)
+
+  stage "building in $dir with jobs=$build_jobs"
+
+  cd "$dir"
+
+  if [ -x ./autogen.sh ]; then
+    run_cmd ./autogen.sh "$@"
+  else
+    if [ ! -x ./configure ]; then
+      run_cmd autoreconf -fi
+    fi
+    run_cmd ./configure "$@"
+  fi
+
+  run_cmd "$mk" -j"$build_jobs"
+  run_root_cmd "$mk" install
+}
+
+configure_build_install(){
+  local dir=$1
+  shift
+
+  configure_build_install_with_jobs "$JOBS" "$dir" "$@"
+}
+
+build_afterstep(){
+  clone_or_update afterstep "$AFTERSTEP_REPO"
+  patch_afterstep_for_chimera
+  clean_afterstep_if_requested
+
+  configure_build_install_with_jobs "$AFTERSTEP_JOBS" "${WORKDIR}/afterstep" \
+    --prefix="$PREFIX" \
+    --with-xpm \
+    --with-jpeg \
+    --with-png
+}
+
+prepare_xdm_cpp_wrapper(){
+  stage "preparing xdm C preprocessor wrapper"
+
+  local wrapper="${XDM_CPP_WRAPPER:-${WORKDIR}/xdm-cpp-wrapper}"
+
+  mkdir -p "$(dirname "$wrapper")"
+
+  cat >"$wrapper" <<'EOF'
+#!/bin/sh
+# xdm-cpp-wrapper:
+# Some old X.Org configure macros invoke the C preprocessor with stdin
+# redirection but no explicit input file. Clang/Chimera cc -E reports
+# "no input files" in that mode unless '-' is supplied. This wrapper keeps
+# normal file-based preprocessing intact, but supplies '-' for stdin-based
+# configure probes.
+set -eu
+
+cc_bin=${CC:-cc}
+has_input=0
+
+for arg in "$@"; do
+  case "$arg" in
+    -)
+      has_input=1
+      ;;
+    *.c|*.h|*.i|*.S|*.s|*.cc|*.cpp|*.cxx|*.C)
+      if [ -e "$arg" ]; then
+        has_input=1
+      fi
+      ;;
+  esac
+done
+
+if [ "$has_input" -eq 1 ]; then
+  exec "$cc_bin" -E "$@"
+fi
+
+if [ -t 0 ]; then
+  exec "$cc_bin" -E -x c "$@" /dev/null
+else
+  exec "$cc_bin" -E -x c "$@" -
+fi
+EOF
+
+  chmod 0755 "$wrapper"
+  log "xdm CPP wrapper: $wrapper"
+
+  # Smoke-test the exact failure mode: cc -E with no explicit input file.
+  if ! printf '' | CC=${CC:-cc} "$wrapper" >/dev/null 2>&1; then
+    die "xdm CPP wrapper smoke test failed: $wrapper"
+  fi
+}
+
+
+prepend_colon_path(){
+  local var=$1
+  local value=$2
+  local current
+
+  [ -n "$value" ] || return 0
+  [ -d "$value" ] || return 0
+
+  eval "current=\${$var:-}"
+
+  case ":$current:" in
+    *":$value:"*) return 0 ;;
+  esac
+
+  if [ -n "$current" ]; then
+    eval "export $var=\"$value:$current\""
+  else
+    eval "export $var=\"$value\""
+  fi
+}
+
+xaw_header_dir(){
+  local dir
+
+  for dir in \
+    "${PREFIX}/include" \
+    /usr/local/include \
+    /usr/include
+  do
+    [ -r "${dir}/X11/Xaw/Paned.h" ] && printf '%s\n' "$dir" && return 0
+  done
+
+  return 1
+}
+
+xaw_lib_dir(){
+  local dir
+
+  for dir in \
+    "${PREFIX}/lib" \
+    /usr/local/lib \
+    /usr/lib \
+    /lib
+  do
+    [ -e "${dir}/libXaw.so" ] || [ -e "${dir}/libXaw.a" ] || [ -e "${dir}/libXaw.so.7" ] || continue
+    printf '%s\n' "$dir"
+    return 0
+  done
+
+  return 1
+}
+
+export_xaw_paths(){
+  local inc lib
+
+  inc=$(xaw_header_dir 2>/dev/null || true)
+  lib=$(xaw_lib_dir 2>/dev/null || true)
+
+  if [ -n "$inc" ]; then
+    case " ${XDM_TOOLKIT_CFLAGS:-} " in
+      *" -I${inc} "*) ;;
+      *) XDM_TOOLKIT_CFLAGS="-I${inc} ${XDM_TOOLKIT_CFLAGS:-}" ;;
+    esac
+  fi
+
+  if [ -n "$lib" ]; then
+    prepend_colon_path PKG_CONFIG_PATH "${lib}/pkgconfig"
+    prepend_colon_path PKG_CONFIG_PATH "${lib}/../share/pkgconfig"
+
+    case " ${XDM_TOOLKIT_LIBS:-} " in
+      *" -L${lib} "*) ;;
+      *) XDM_TOOLKIT_LIBS="-L${lib} ${XDM_TOOLKIT_LIBS:-}" ;;
+    esac
+  fi
+
+  prepend_colon_path PKG_CONFIG_PATH "${PREFIX}/lib/pkgconfig"
+  prepend_colon_path PKG_CONFIG_PATH "${PREFIX}/share/pkgconfig"
+
+  export PKG_CONFIG_PATH
+  export XDM_TOOLKIT_CFLAGS XDM_TOOLKIT_LIBS
+}
+
+normalize_xdm_toolkit_libs(){
+  # Keep libraries in LDADD/chooser_LDADD position, not only LDFLAGS.
+  # Link order matters with lld/clang: objects must usually come before libs.
+  local lib
+
+  for lib in -lXaw -lXmu -lXt -lXext -lX11 -lSM -lICE; do
+    case " ${XDM_TOOLKIT_LIBS:-} " in
+      *" ${lib} "*) ;;
+      *) XDM_TOOLKIT_LIBS="${XDM_TOOLKIT_LIBS:-} ${lib}" ;;
+    esac
+  done
+
+  # Collapse harmless extra whitespace.
+  XDM_TOOLKIT_LIBS=$(printf '%s\n' "${XDM_TOOLKIT_LIBS:-}" | awk '{$1=$1; print}')
+  XDM_TOOLKIT_CFLAGS=$(printf '%s\n' "${XDM_TOOLKIT_CFLAGS:-}" | awk '{$1=$1; print}')
+
+  export XDM_TOOLKIT_CFLAGS XDM_TOOLKIT_LIBS
+}
+
+patch_xdm_chooser_build_flags(){
+  stage "patching xdm chooser build/link flags"
+
+  local mf="${WORKDIR}/xdm/chooser/Makefile"
+  local tmp
+
+  [ -f "$mf" ] || {
+    log "xdm chooser Makefile not present; chooser may be skipped"
+    return 0
+  }
+
+  normalize_xdm_toolkit_libs
+
+  log "forcing chooser CPPFLAGS: ${XDM_TOOLKIT_CFLAGS:-}"
+  log "forcing chooser LDADD/LIBS: ${XDM_TOOLKIT_LIBS:-}"
+
+  tmp=$(mktemp)
+
+  awk '
+    /chimera_xdm_chooser_link_patch_BEGIN/ {
+      skip = 1
+      next
+    }
+
+    /chimera_xdm_chooser_link_patch_END/ {
+      skip = 0
+      next
+    }
+
+    !skip {
+      print
+    }
+  ' "$mf" > "$tmp"
+
+  cat >>"$tmp" <<EOF
+
+# chimera_xdm_chooser_link_patch_BEGIN
+# Chimera/lld needs the Xaw/Xt libraries after chooser.o, not only in LDFLAGS.
+XDM_TOOLKIT_EXTRA_CPPFLAGS = ${XDM_TOOLKIT_CFLAGS:-}
+XDM_TOOLKIT_EXTRA_LIBS = ${XDM_TOOLKIT_LIBS:-}
+CPPFLAGS += \$(XDM_TOOLKIT_EXTRA_CPPFLAGS)
+AM_CPPFLAGS += \$(XDM_TOOLKIT_EXTRA_CPPFLAGS)
+LDADD += \$(XDM_TOOLKIT_EXTRA_LIBS)
+chooser_LDADD += \$(XDM_TOOLKIT_EXTRA_LIBS)
+LIBS += \$(XDM_TOOLKIT_EXTRA_LIBS)
+# chimera_xdm_chooser_link_patch_END
+EOF
+
+  cp "$mf" "${mf}.bak.$(date '+%Y%m%d%H%M%S')"
+  mv "$tmp" "$mf"
+
+  log "patched xdm chooser Makefile with explicit toolkit link flags"
+}
+
+patch_xdm_skip_chooser(){
+  stage "patching xdm to skip chooser"
+
+  local dir="${WORKDIR}/xdm"
+  local f tmp
+
+  [ "${XDM_SKIP_CHOOSER_IF_NO_XAW:-1}" = 1 ] || die "Xaw headers missing and XDM_SKIP_CHOOSER_IF_NO_XAW is disabled"
+  [ -d "$dir" ] || die "xdm checkout not found: $dir"
+
+  for f in "${dir}/Makefile.am" "${dir}/Makefile.in"; do
+    [ -f "$f" ] || continue
+
+    if grep -q 'chimera_xdm_skip_chooser_patch' "$f"; then
+      log "xdm chooser skip patch already applied: $f"
+      continue
+    fi
+
+    log "removing chooser from xdm recursive build file: $f"
+    tmp=$(mktemp)
+
+    awk '
+      BEGIN { marked = 0 }
+      {
+        line = $0
+        if (line ~ /(^|[[:space:]])chooser([[:space:]]|$)/) {
+          if (!marked) {
+            print "# chimera_xdm_skip_chooser_patch: Xaw headers were unavailable; skip chooser."
+            marked = 1
+          }
+          gsub(/(^|[[:space:]])chooser([[:space:]]|$)/, " ", line)
+          gsub(/[[:space:]][[:space:]]+/, " ", line)
+          gsub(/[[:space:]]+$/, "", line)
+        }
+        print line
+      }
+    ' "$f" > "$tmp"
+
+    cp "$f" "${f}.bak.$(date '+%Y%m%d%H%M%S')"
+    mv "$tmp" "$f"
+  done
+
+  log "xdm chooser will be skipped; core xdm will still be built and installed"
+}
+
+ensure_xaw_for_xdm(){
+  stage "ensuring xdm Xaw headers"
+
+  local inc
+  inc=$(xaw_header_dir 2>/dev/null || true)
+  if [ -n "$inc" ]; then
+    log "found Xaw header: ${inc}/X11/Xaw/Paned.h"
+    export_xaw_paths
+    return 0
+  fi
+
+  warn "Xaw header not found: X11/Xaw/Paned.h"
+  warn "trying additional apk package candidates for Xaw development headers"
+
+  apk_add_any_optional "Xaw development headers" \
+    pc:xaw7 \
+    pc:xaw \
+    pc:xaw6 \
+    libxaw-devel \
+    libxaw-dev \
+    libXaw-devel \
+    xorg-libxaw \
+    xorg-libXaw \
+    libxaw
+
+  inc=$(xaw_header_dir 2>/dev/null || true)
+  if [ -n "$inc" ]; then
+    log "found Xaw header after apk attempt: ${inc}/X11/Xaw/Paned.h"
+    export_xaw_paths
+    return 0
+  fi
+
+  if [ "${BUILD_LIBXAW_IF_MISSING:-1}" = 1 ]; then
+    warn "Xaw headers still missing; building libXaw from source"
+    clone_or_update libXaw "$LIBXAW_REPO" "$LIBXAW_REPO_FALLBACK"
+
+    if configure_build_install_with_jobs "$JOBS" "${WORKDIR}/libXaw" --prefix="$PREFIX"; then
+      log "installed libXaw from source"
+    else
+      warn "libXaw source build failed"
+    fi
+  else
+    warn "BUILD_LIBXAW_IF_MISSING=${BUILD_LIBXAW_IF_MISSING:-}; not building libXaw from source"
+  fi
+
+  inc=$(xaw_header_dir 2>/dev/null || true)
+  if [ -n "$inc" ]; then
+    log "found Xaw header after libXaw source install: ${inc}/X11/Xaw/Paned.h"
+    export_xaw_paths
+    return 0
+  fi
+
+  warn "Xaw header still unavailable after package/source attempts"
+  patch_xdm_skip_chooser
+}
+
+
+prepare_xdm_toolkit_env(){
+  stage "preparing xdm Xaw toolkit flags"
+  export_xaw_paths
+
+  if [ "${XDM_TOOLKIT_FALLBACK:-1}" != 1 ]; then
+    log "xdm toolkit fallback disabled by XDM_TOOLKIT_FALLBACK=${XDM_TOOLKIT_FALLBACK:-}"
+    return 0
+  fi
+
+  if [ -n "${XDM_TOOLKIT_CFLAGS:-}" ] || [ -n "${XDM_TOOLKIT_LIBS:-}" ]; then
+    log "using existing XDM_TOOLKIT_CFLAGS/XDM_TOOLKIT_LIBS as a base"
+    normalize_xdm_toolkit_libs
+    log "XDM_TOOLKIT_CFLAGS=$XDM_TOOLKIT_CFLAGS"
+    log "XDM_TOOLKIT_LIBS=$XDM_TOOLKIT_LIBS"
+    return 0
+  fi
+
+  local pc pcname cflags libs
+  pc=$(pkgconf_cmd || true)
+
+  if [ -n "$pc" ]; then
+    for pcname in xaw7 xaw xaw6; do
+      if "$pc" --exists "$pcname" >/dev/null 2>&1; then
+        XDM_TOOLKIT_CFLAGS=$("$pc" --cflags "$pcname" 2>/dev/null || true)
+        XDM_TOOLKIT_LIBS=$("$pc" --libs "$pcname" 2>/dev/null || true)
+        export XDM_TOOLKIT_CFLAGS XDM_TOOLKIT_LIBS
+        log "using pkg-config toolkit module for xdm: $pcname"
+        log "XDM_TOOLKIT_CFLAGS=$XDM_TOOLKIT_CFLAGS"
+        log "XDM_TOOLKIT_LIBS=$XDM_TOOLKIT_LIBS"
+        return 0
+      fi
+    done
+
+    # Chimera may provide the Xaw library but not an xaw7 pkg-config module.
+    # Build usable fallback flags from the lower-level X11 modules when present.
+    cflags=$("$pc" --cflags x11 xmu xt xext 2>/dev/null || true)
+    libs=$("$pc" --libs x11 xmu xt xext 2>/dev/null || true)
+  else
+    warn "pkg-config/pkgconf unavailable while preparing xdm toolkit fallback"
+    cflags=
+    libs=
+  fi
+
+  XDM_TOOLKIT_CFLAGS=${cflags:-}
+  if [ -n "$libs" ]; then
+    XDM_TOOLKIT_LIBS="-lXaw $libs"
+  else
+    XDM_TOOLKIT_LIBS="-lXaw -lXmu -lXt -lXext -lX11"
+  fi
+
+  normalize_xdm_toolkit_libs
+
+  log "xaw7.pc not found; using explicit Xaw fallback for xdm"
+  log "XDM_TOOLKIT_CFLAGS=$XDM_TOOLKIT_CFLAGS"
+  log "XDM_TOOLKIT_LIBS=$XDM_TOOLKIT_LIBS"
+}
+
+build_xdm(){
+  clone_or_update xdm "$XDM_REPO" "$XDM_REPO_FALLBACK"
+  prepare_xdm_cpp_wrapper
+  ensure_xaw_for_xdm
+  prepare_xdm_toolkit_env
+
+  export CPPFLAGS="${CPPFLAGS:-} ${XDM_TOOLKIT_CFLAGS:-}"
+  export LDFLAGS="${LDFLAGS:-} ${XDM_TOOLKIT_LIBS:-}"
+
+  local xserver xrdb mk
+  xserver=$(first_command Xorg X || printf '%s\n' /usr/bin/Xorg)
+  xrdb=$(first_command xrdb || printf '%s\n' /usr/bin/xrdb)
+  mk=$(make_cmd)
+
+  stage "building xdm"
+
+  cd "${WORKDIR}/xdm"
+
+  local -a cfg=(
+    --prefix="$PREFIX"
+    --with-xdmlibdir="${PREFIX}/lib/X11/xdm"
+    --with-xdmconfigdir=/etc/X11/xdm
+    --with-xdmscriptdir=/etc/X11/xdm
+    --with-logdir=/var/log
+    --with-piddir=/run
+    --with-authdir=/var/lib/xdm
+    --with-default-vt=vt7
+    --with-default-session="${PREFIX}/bin/afterstep"
+    --with-xrdb="$xrdb"
+    --with-systemdsystemunitdir=no
+    --with-systemd-daemon=no
+  )
+
+  if [ -x ./autogen.sh ]; then
+    run_cmd env \
+      CPP="$XDM_CPP_WRAPPER" \
+      CPPFLAGS="${CPPFLAGS:-} ${XDM_TOOLKIT_CFLAGS:-}" \
+      LDFLAGS="${LDFLAGS:-} ${XDM_TOOLKIT_LIBS:-}" \
+      XDM_TOOLKIT_CFLAGS="${XDM_TOOLKIT_CFLAGS:-}" \
+      XDM_TOOLKIT_LIBS="${XDM_TOOLKIT_LIBS:-}" \
+      DEF_SERVER="$xserver" \
+      DEF_SERVER_LINE=":0 local ${xserver} :0 vt7 -nolisten tcp" \
+      ./autogen.sh "${cfg[@]}"
+  else
+    if [ ! -x ./configure ]; then
+      run_cmd autoreconf -fi
+    fi
+
+    run_cmd env \
+      CPP="$XDM_CPP_WRAPPER" \
+      CPPFLAGS="${CPPFLAGS:-} ${XDM_TOOLKIT_CFLAGS:-}" \
+      LDFLAGS="${LDFLAGS:-} ${XDM_TOOLKIT_LIBS:-}" \
+      XDM_TOOLKIT_CFLAGS="${XDM_TOOLKIT_CFLAGS:-}" \
+      XDM_TOOLKIT_LIBS="${XDM_TOOLKIT_LIBS:-}" \
+      DEF_SERVER="$xserver" \
+      DEF_SERVER_LINE=":0 local ${xserver} :0 vt7 -nolisten tcp" \
+      ./configure "${cfg[@]}"
+  fi
+
+  normalize_xdm_toolkit_libs
+  patch_xdm_chooser_build_flags
+
+  run_cmd "$mk" -j"$JOBS"
+  run_root_cmd "$mk" install
+}
+
+
+build_esxdm(){
+  clone_or_update esxdm "$ESXDM_REPO" "$ESXDM_REPO_FALLBACK"
+
+  local dir="${WORKDIR}/esxdm"
+  local mk cxx pc xft_cflags xft_libs fontconfig_libs
+  mk=$(make_cmd)
+  cxx=$(first_command c++ clang++ g++ || true)
+
+  [ -n "$cxx" ] || die "no C++ compiler found for esxdm"
+  [ -f "${dir}/Makefile" ] || die "esxdm Makefile not found: ${dir}/Makefile"
+
+  pc=$(pkgconf_cmd || true)
+  if [ -n "$pc" ]; then
+    xft_cflags=$($pc --cflags xft 2>/dev/null || true)
+    xft_libs=$($pc --libs xft 2>/dev/null || true)
+    fontconfig_libs=$($pc --libs fontconfig 2>/dev/null || true)
+  else
+    xft_cflags=
+    xft_libs=
+    fontconfig_libs=
+  fi
+
+  stage "building esxdm"
+  cd "$dir"
+
+  # Build the upstream Makefile but install manually so the dinit service can
+  # use the selected PREFIX instead of the repository Makefile's /usr/bin path.
+  run_cmd "$mk" -j"$JOBS"     CXX="$cxx"     PREFIX="$PREFIX"     XFT_CFLAGS="$xft_cflags"     XFT_LIBS="$xft_libs"     FONTCONFIG_LIBS="$fontconfig_libs"
+
+  run_root_cmd install -D -m 0755 "${dir}/esxdm" "${PREFIX}/bin/esxdm"
+}
+
+
+backup_root(){
+  local path=$1
+
+  if [ -e "$path" ]; then
+    local backup="${path}.bak.$(date '+%Y%m%d%H%M%S')"
+    log "backup: $path -> $backup"
+    root cp -a "$path" "$backup"
+  fi
+}
+
+write_root(){
+  local path=$1
+  local mode=${2:-0644}
+  local tmp
+
+  tmp=$(mktemp)
+  cat >"$tmp"
+
+  log "write: $path mode=$mode"
+  root install -D -m "$mode" "$tmp" "$path"
+
+  rm -f "$tmp"
+}
+
+setup_keyboard_layout(){
+  [ -n "$KEYBOARD_LAYOUT" ] || return 0
+
+  stage "configuring keyboard layout"
+
+  log "XkbLayout=$KEYBOARD_LAYOUT"
+
+  run_root_cmd mkdir -p /etc/X11/xorg.conf.d
+
+  backup_root /etc/X11/xorg.conf.d/00-keyboard.conf
+  write_root /etc/X11/xorg.conf.d/00-keyboard.conf 0644 <<EOF
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$KEYBOARD_LAYOUT"
+EndSection
+EOF
+}
+
+add_user_to_group_if_present(){
+  local user=$1
+  local group=$2
+
+  getent group "$group" >/dev/null 2>&1 || {
+    warn "group does not exist, skipping: $group"
+    return 0
+  }
+
+  id -nG "$user" | tr ' ' '\n' | grep -qx "$group" && {
+    log "user $user already belongs to group $group"
+    return 0
+  }
+
+  log "adding $user to group $group"
+
+  if command -v addgroup >/dev/null 2>&1; then
+    root addgroup "$user" "$group" >/dev/null 2>&1 || warn "addgroup failed for $user -> $group"
+  elif command -v usermod >/dev/null 2>&1; then
+    root usermod -aG "$group" "$user" >/dev/null 2>&1 || warn "usermod failed for $user -> $group"
+  elif command -v pw >/dev/null 2>&1; then
+    root pw groupmod "$group" -m "$user" >/dev/null 2>&1 || warn "pw groupmod failed for $user -> $group"
+  else
+    warn "no addgroup/usermod/pw command found; could not add $user to $group"
+  fi
+}
+
+setup_user_session(){
+  [ -n "$USERNAME" ] || return 0
+
+  stage "configuring user session"
+
+  local home group tmp
+  home=$(getent passwd "$USERNAME" | awk -F: '{print $6}')
+  group=$(id -gn "$USERNAME")
+
+  [ -d "$home" ] || die "home directory does not exist for $USERNAME: $home"
+
+  log "user=$USERNAME home=$home group=$group"
+
+  add_user_to_group_if_present "$USERNAME" video
+  add_user_to_group_if_present "$USERNAME" audio
+  add_user_to_group_if_present "$USERNAME" input
+
+  backup_root "$home/.xsession"
+
+  tmp=$(mktemp)
+
+  cat >"$tmp" <<EOF
+#!/bin/sh
+export PATH=/bin:/usr/bin:/usr/local/bin:${PREFIX}/bin
+
+start_user_service(){
+    command -v dinitctl >/dev/null 2>&1 || return 1
+    dinitctl start "\$1" >/dev/null 2>&1 || true
+}
+
+start_if_missing(){
+    command -v "\$1" >/dev/null 2>&1 || return 0
+
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -u "\$(id -u)" -x "\$1" >/dev/null 2>&1 && return 0
+    fi
+
+    "\$@" >/dev/null 2>&1 &
+}
+
+start_user_service pipewire
+start_user_service wireplumber
+start_user_service pipewire-pulse
+
+if ! command -v dinitctl >/dev/null 2>&1; then
+    start_if_missing pipewire
+    start_if_missing wireplumber
+    start_if_missing pipewire-pulse
+fi
+
+if command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session ${PREFIX}/bin/afterstep
+fi
+
+exec ${PREFIX}/bin/afterstep
+EOF
+
+  log "write: $home/.xsession"
+  root install -D -o "$USERNAME" -g "$group" -m 0755 "$tmp" "$home/.xsession"
+
+  rm -f "$tmp"
+}
+
+install_video_drivers(){
+  stage "checking video drivers"
+
+  apk_add_list optional "generic graphics userspace" \
+    mesa \
+    libdrm
+
+  local vendors vendor
+  vendors=$(
+    for d in /sys/class/drm/card*/device/vendor; do
+      [ -r "$d" ] && cat "$d"
+    done 2>/dev/null | sort -u || true
+  )
+
+  if [ -z "$vendors" ]; then
+    warn "no DRM GPU vendor found under /sys/class/drm"
+    warn "relying on Xorg autodetection/modesetting"
+    return 0
+  fi
+
+  log "detected GPU vendor IDs: $(printf '%s' "$vendors" | tr '\n' ' ')"
+
+  while IFS= read -r vendor; do
+    case "$vendor" in
+      0x1002)
+        apk_add_any_optional "AMD Xorg driver" \
+          xserver-xorg-video-amdgpu \
+          xf86-video-amdgpu
+        apk_add_any_optional "AMD fallback ATI Xorg driver" \
+          xserver-xorg-video-ati \
+          xf86-video-ati
+        ;;
+      0x8086)
+        apk_add_any_optional "Intel Xorg driver" \
+          xserver-xorg-video-intel \
+          xf86-video-intel
+        ;;
+      0x10de)
+        apk_add_any_optional "Nouveau Xorg driver" \
+          xserver-xorg-video-nouveau \
+          xf86-video-nouveau
+        warn "NVIDIA proprietary drivers are not handled"
+        ;;
+      0x1af4)
+        apk_add_any_optional "virtio/fbdev Xorg driver" \
+          xserver-xorg-video-fbdev \
+          xf86-video-fbdev
+        ;;
+      0x15ad)
+        apk_add_any_optional "VMware Xorg driver" \
+          xserver-xorg-video-vmware \
+          xf86-video-vmware
+        ;;
+      *)
+        warn "unknown GPU vendor ${vendor}; relying on Xorg modesetting/autodetect"
+        ;;
+    esac
+  done <<<"$vendors"
+}
+
+
+dinit_service_lookup_paths(){
+  printf '%s\n' \
+    "$DINIT_SERVICE_DIR" \
+    /etc/dinit.d \
+    /usr/local/lib/dinit.d \
+    /usr/lib/dinit.d
+}
+
+dinit_find_service_file(){
+  local service=$1
+  local dir
+
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    [ -f "${dir}/${service}" ] && printf '%s\n' "${dir}/${service}" && return 0
+  done < <(dinit_service_lookup_paths)
+
+  return 1
+}
+
+dinit_check_service(){
+  local service=$1
+
+  command -v dinitcheck >/dev/null 2>&1 || {
+    warn "dinitcheck not found; skipping offline dinit validation"
+    return 0
+  }
+
+  stage "checking dinit service: $service"
+
+  if dinitcheck -s "$service"; then
+    log "dinitcheck passed for: $service"
+    return 0
+  fi
+
+  warn "dinitcheck -s $service failed; retrying with explicit service directories"
+
+  if dinitcheck \
+      -d "$DINIT_SERVICE_DIR" \
+      -d /etc/dinit.d \
+      -d /usr/local/lib/dinit.d \
+      -d /usr/lib/dinit.d \
+      "$service"; then
+    log "dinitcheck passed for: $service using explicit service directories"
+    return 0
+  fi
+
+  warn "dinitcheck failed for service: $service"
+
+  local service_file
+  service_file=$(dinit_find_service_file "$service" 2>/dev/null || true)
+
+  if [ -n "$service_file" ]; then
+    warn "service file content follows: $service_file"
+    sed 's/^/    /' "$service_file" >&2 || true
+  fi
+
+  return 1
+}
+
+dinit_enable_service_link(){
+  local service=$1
+  local service_file=$2
+
+  run_root_cmd mkdir -p "$DINIT_BOOT_DIR"
+
+  log "linking dinit boot service: ${DINIT_BOOT_DIR}/${service} -> ${service_file}"
+  root ln -sfn "$service_file" "${DINIT_BOOT_DIR}/${service}"
+}
+
+dinit_enable_xdm(){
+  local service=$1
+  local service_file=$2
+
+  dinit_check_service "$service" || {
+    warn "not enabling $service because dinitcheck failed"
+    warn "run manually for details: dinitcheck -s $service"
+    return 1
+  }
+
+  dinit_enable_service_link "$service" "$service_file"
+
+  if command -v dinitctl >/dev/null 2>&1; then
+    log "asking dinit to enable/reload service: $service"
+
+    if root dinitctl enable "$service" >/dev/null 2>&1; then
+      log "dinitctl enable succeeded: $service"
+    else
+      warn "dinitctl enable failed; preserving boot symlink and running diagnostics"
+
+      if root dinitctl status "$service" >/dev/null 2>&1; then
+        log "dinit already knows service: $service"
+      else
+        warn "dinit does not currently have $service loaded"
+      fi
+
+      dinit_check_service "$service" || true
+
+      if command -v dinitctl >/dev/null 2>&1; then
+        root dinitctl list 2>/dev/null | grep -E 'boot|login|init|dbus|xdm' || true
+      fi
+    fi
+
+    if [ "$START_XDM" = 1 ] || [ "${DINIT_START_XDM_AFTER_ENABLE:-0}" = 1 ]; then
+      log "starting xdm through dinit"
+      root dinitctl start "$service" || warn "dinitctl start $service failed"
+    fi
+  else
+    warn "dinitctl not found; service file and boot symlink were installed"
+  fi
+}
+
+
+dinit_remove_boot_link(){
+  local service=$1
+  local path="${DINIT_BOOT_DIR}/${service}"
+
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+
+  log "removing conflicting dinit boot service link: $path"
+  root rm -f "$path" || warn "could not remove conflicting boot link: $path"
+}
+
+
+setup_xdm(){
+  stage "configuring xdm"
+
+  local xserver xdm_bin service service_file env_file
+  xserver=$(first_command Xorg X || printf '%s\n' /usr/bin/Xorg)
+  xdm_bin="${PREFIX}/bin/xdm"
+  service="${DINIT_XDM_SERVICE:-xdm}"
+  service_file="${DINIT_SERVICE_DIR}/${service}"
+  env_file="/etc/X11/xdm/xdm-env"
+
+  log "X server: $xserver"
+  log "xdm binary: $xdm_bin"
+  log "dinit service: $service"
+  log "dinit service file: $service_file"
+
+  run_root_cmd mkdir -p \
+    /etc/X11/xdm \
+    /var/lib/xdm \
+    /var/log \
+    "${PREFIX}/share/xsessions" \
+    "$DINIT_SERVICE_DIR" \
+    "$DINIT_BOOT_DIR"
+
+  backup_root /etc/X11/xdm/Xservers
+  write_root /etc/X11/xdm/Xservers 0644 <<EOF
+:0 local ${xserver} :0 vt7 -nolisten tcp
+EOF
+
+  backup_root /etc/X11/xdm/Xsession
+  write_root /etc/X11/xdm/Xsession 0755 <<EOF
+#!/bin/sh
+export PATH=/bin:/usr/bin:/usr/local/bin:${PREFIX}/bin
+
+if [ -r "\$HOME/.xsession" ]; then
+    exec "\$HOME/.xsession"
+fi
+
+if [ -x "${PREFIX}/bin/afterstep" ]; then
+    exec "${PREFIX}/bin/afterstep"
+fi
+
+if command -v xterm >/dev/null 2>&1; then
+    exec xterm -ls
+fi
+
+exec /bin/sh -l
+EOF
+
+  write_root "${PREFIX}/share/xsessions/afterstep.desktop" 0644 <<EOF
+[Desktop Entry]
+Name=AfterStep
+Comment=AfterStep window manager
+Exec=${PREFIX}/bin/afterstep
+Type=Application
+DesktopNames=AfterStep
+EOF
+
+  # Keep runtime library and executable paths explicit for locally built X11 bits.
+  write_root "$env_file" 0644 <<EOF
+PATH=/bin:/usr/bin:/usr/local/bin:${PREFIX}/bin
+LD_LIBRARY_PATH=${PREFIX}/lib:/usr/local/lib:/usr/lib:/lib
+EOF
+
+  # Install the service in /etc/dinit.d by default. Chimera scans /etc/dinit.d,
+  # /usr/local/lib/dinit.d and /usr/lib/dinit.d, but /etc/dinit.d is the most
+  # robust location for admin-created local services.
+  #
+  # Intentionally keep this service dependency-free. The previous generated
+  # file used a hard dependency on init-done.target; if that target is absent,
+  # renamed, or not visible in a minimal install, dinit refuses to load xdm.
+  # Boot activation is handled by the boot.d symlink/dinitctl enable.
+  backup_root "$service_file"
+  write_root "$service_file" 0644 <<EOF
+# Local xdm service for Chimera/dinit
+type = process
+command = ${xdm_bin} -nodaemon -config /etc/X11/xdm/xdm-config
+env-file = ${env_file}
+restart = true
+smooth-recovery = true
+EOF
+
+  # Remove stale service file from older script versions so dinit does not load
+  # the wrong one from another scanned directory.
+  if [ "$service_file" != "${PREFIX}/lib/dinit.d/${service}" ] && [ -e "${PREFIX}/lib/dinit.d/${service}" ]; then
+    log "removing stale old dinit service file: ${PREFIX}/lib/dinit.d/${service}"
+    root rm -f "${PREFIX}/lib/dinit.d/${service}" || warn "could not remove stale ${PREFIX}/lib/dinit.d/${service}"
+  fi
+
+  setup_keyboard_layout
+  setup_user_session
+
+  dinit_remove_boot_link "${DINIT_ESXDM_SERVICE:-esxdm}"
+
+  if ! dinit_enable_xdm "$service" "$service_file"; then
+    cat >&2 <<EOF
+[!] xdm service file was installed but dinit did not accept it.
+
+Inspect:
+    dinitcheck -s ${service}
+    dinitcheck -n ${service}
+    dinitctl catlog ${service}
+    dinitctl status ${service}
+    cat ${service_file}
+    ls -l ${DINIT_BOOT_DIR}/${service}
+
+The script intentionally installed a minimal service in:
+    ${service_file}
+
+Boot symlink target:
+    ${DINIT_BOOT_DIR}/${service}
+EOF
+  fi
+}
+
+setup_esxdm(){
+  stage "configuring esxdm"
+
+  local esxdm_bin service service_file env_file pam_file
+  esxdm_bin="${PREFIX}/bin/esxdm"
+  service="${DINIT_ESXDM_SERVICE:-esxdm}"
+  service_file="${DINIT_SERVICE_DIR}/${service}"
+  env_file="/etc/esxdm/esxdm-env"
+  pam_file="${ESXDM_PAM_DIR}/esxdm"
+
+  [ -x "$esxdm_bin" ] || die "missing esxdm binary: $esxdm_bin"
+
+  log "esxdm binary: $esxdm_bin"
+  log "dinit service: $service"
+  log "dinit service file: $service_file"
+  log "PAM file: $pam_file"
+
+  run_root_cmd mkdir -p     /etc/esxdm     /var/log     "${PREFIX}/share/xsessions"     "$DINIT_SERVICE_DIR"     "$DINIT_BOOT_DIR"     "$ESXDM_PAM_DIR"
+
+  write_root "${PREFIX}/share/xsessions/afterstep.desktop" 0644 <<EOF
+[Desktop Entry]
+Name=AfterStep
+Comment=AfterStep window manager
+Exec=${PREFIX}/bin/afterstep
+Type=Application
+DesktopNames=AfterStep
+EOF
+
+  write_root "$env_file" 0644 <<EOF
+PATH=/bin:/usr/bin:/usr/local/bin:${PREFIX}/bin
+LD_LIBRARY_PATH=${PREFIX}/lib:/usr/local/lib:/usr/lib:/lib
+XDG_DATA_DIRS=${PREFIX}/share:/usr/local/share:/usr/share
+EOF
+
+  backup_root "$pam_file"
+  write_root "$pam_file" 0644 <<EOF
+auth include system-login
+account include system-login
+password include system-login
+session include system-login
+EOF
+
+  backup_root "$service_file"
+  write_root "$service_file" 0644 <<EOF
+# Local esxdm service for Chimera/dinit
+type = process
+command = ${esxdm_bin} --display :0 --vt 7
+env-file = ${env_file}
+restart = true
+smooth-recovery = true
+EOF
+
+  setup_keyboard_layout
+  setup_user_session
+
+  # In esxdm mode, bypass xdm at boot to avoid two display managers racing for :0.
+  dinit_remove_boot_link "${DINIT_XDM_SERVICE:-xdm}"
+
+  if ! dinit_enable_xdm "$service" "$service_file"; then
+    cat >&2 <<EOF
+[!] esxdm service file was installed but dinit did not accept it.
+
+Inspect:
+    dinitcheck -s ${service}
+    dinitcheck -n ${service}
+    dinitctl catlog ${service}
+    dinitctl status ${service}
+    cat ${service_file}
+    ls -l ${DINIT_BOOT_DIR}/${service}
+
+The script intentionally installed a minimal service in:
+    ${service_file}
+
+Boot symlink target:
+    ${DINIT_BOOT_DIR}/${service}
+EOF
+  fi
+}
+
+validate_multimedia(){
+  stage "validating multimedia"
+
+  if command -v pipewire >/dev/null 2>&1; then
+    pipewire --version || warn "pipewire exists but version check failed"
+  else
+    warn "pipewire command not found"
+  fi
+
+  command -v wireplumber >/dev/null 2>&1 || warn "wireplumber command not found"
+  command -v pipewire-pulse >/dev/null 2>&1 || warn "pipewire-pulse command not found"
+
+  if [ -n "$USERNAME" ]; then
+    local home
+    home=$(getent passwd "$USERNAME" | awk -F: '{print $6}')
+
+    if [ -r "$home/.xsession" ]; then
+      grep -q 'pipewire' "$home/.xsession" || warn "$home/.xsession does not reference pipewire"
+    fi
+  fi
+
+  if command -v dinitctl >/dev/null 2>&1; then
+    dinitctl list 2>/dev/null | grep -E 'dbus|pipewire|wireplumber|xdm|esxdm' || true
+  fi
+}
+
+validate(){
+  stage "validating install"
+
+  local ok=1
+
+  [ -x "${PREFIX}/bin/afterstep" ] || {
+    warn "missing executable: ${PREFIX}/bin/afterstep"
+    ok=0
+  }
+
+  if [ "$DISPLAY_MANAGER" = esxdm ]; then
+    local esxdm_service esxdm_pam
+    esxdm_service="${DINIT_ESXDM_SERVICE:-esxdm}"
+    esxdm_pam="${ESXDM_PAM_DIR}/esxdm"
+
+    [ -x "${PREFIX}/bin/esxdm" ] || {
+      warn "missing executable: ${PREFIX}/bin/esxdm"
+      ok=0
+    }
+
+    [ -r "${DINIT_SERVICE_DIR}/${esxdm_service}" ] || {
+      warn "missing dinit service: ${DINIT_SERVICE_DIR}/${esxdm_service}"
+      ok=0
+    }
+
+    [ -r "$esxdm_pam" ] || {
+      warn "missing PAM file: $esxdm_pam"
+      ok=0
+    }
+  else
+    [ -x "${PREFIX}/bin/xdm" ] || {
+      warn "missing executable: ${PREFIX}/bin/xdm"
+      ok=0
+    }
+
+    [ -r /etc/X11/xdm/xdm-config ] || {
+      warn "missing config: /etc/X11/xdm/xdm-config"
+      ok=0
+    }
+
+    [ -x /etc/X11/xdm/Xsession ] || {
+      warn "missing or non-executable: /etc/X11/xdm/Xsession"
+      ok=0
+    }
+  fi
+
+  first_command Xorg X >/dev/null 2>&1 || {
+    warn "missing Xorg/X server command"
+    ok=0
+  }
+
+  if [ -n "$KEYBOARD_LAYOUT" ]; then
+    if grep -q "Option \"XkbLayout\" \"$KEYBOARD_LAYOUT\"" /etc/X11/xorg.conf.d/00-keyboard.conf 2>/dev/null; then
+      log "keyboard layout configured: $KEYBOARD_LAYOUT"
+    else
+      warn "keyboard layout was not configured correctly"
+      ok=0
+    fi
+  fi
+
+  if [ -n "$USERNAME" ]; then
+    local home
+    home=$(getent passwd "$USERNAME" | awk -F: '{print $6}')
+
+    [ -x "$home/.xsession" ] || {
+      warn "missing or non-executable user session: $home/.xsession"
+      ok=0
+    }
+  fi
+
+  [ -e /dev/dri/card0 ] || warn "no /dev/dri/card0; kernel DRM or GPU driver may be missing"
+  [ -e /dev/dri/renderD128 ] || warn "no render node; OpenGL/video acceleration may be unavailable"
+
+  validate_multimedia
+
+  [ "$ok" = 1 ] || die "validation failed"
+
+  log "validation passed"
+  log "done"
+  log "log file: $LOGFILE"
+  if [ "$DISPLAY_MANAGER" = esxdm ]; then
+    log "reboot, or run: dinitctl start ${DINIT_ESXDM_SERVICE:-esxdm}"
+  else
+    log "reboot, or run: dinitctl start ${DINIT_XDM_SERVICE:-xdm}"
+  fi
+}
+
+main(){
+  parse_args "$@"
+  init_logging
+  detect_os
+  log "selected display manager: $DISPLAY_MANAGER"
+  setup_privilege
+  install_deps
+  install_video_drivers
+  build_afterstep
+
+  case "$DISPLAY_MANAGER" in
+    xdm)
+      build_xdm
+      setup_xdm
+      ;;
+    esxdm)
+      build_esxdm
+      setup_esxdm
+      ;;
+  esac
+
+  validate
+}
+
+main "$@"
