@@ -12,6 +12,7 @@ CLEAN_AFTERSTEP=${CLEAN_AFTERSTEP:-1}
 START_XDM=${START_XDM:-0}
 TRACE=${TRACE:-0}
 DISPLAY_MANAGER=${DISPLAY_MANAGER:-xdm}
+WINDOW_MANAGER=${WINDOW_MANAGER:-afterstep}
 
 APK_TIMEOUT=${APK_TIMEOUT:-240}
 APK_NET_TIMEOUT=${APK_NET_TIMEOUT:-30}
@@ -34,6 +35,8 @@ XDM_REPO=${XDM_REPO:-https://gitlab.freedesktop.org/xorg/app/xdm.git}
 XDM_REPO_FALLBACK=${XDM_REPO_FALLBACK:-https://github.com/freedesktop-unofficial-mirror/xorg__app__xdm.git}
 ESXDM_REPO=${ESXDM_REPO:-https://github.com/raadsilva1/chimera-esdxm.git}
 ESXDM_REPO_FALLBACK=${ESXDM_REPO_FALLBACK:-}
+CHIUX_REPO=${CHIUX_REPO:-https://github.com/raadsilva1/chiux.git}
+CHIUX_REPO_FALLBACK=${CHIUX_REPO_FALLBACK:-}
 
 USERNAME=
 KEYBOARD_LAYOUT=
@@ -50,52 +53,83 @@ trap 'rc=$?; warn "failed with rc=$rc at line ${LINENO}: ${BASH_COMMAND}"; exit 
 
 usage(){
   cat <<EOF
-Usage: $0 [-u username] [-y keyboard_layout] [-o xdm|esxdm] [-v] [-h]
+Usage: $0 [-u username] [-y keyboard_layout] [-o xdm|esxdm] [-o2 afterstep|chiux] [-v] [-h]
 
 Options:
-  -u <username>          Configure AfterStep .xsession for an existing user
-  -y <keyboard layout>   Configure Xorg keyboard layout, e.g. us, br, de, br,us
-  -o <xdm|esxdm>         Display manager to build/configure; default: xdm
-  -v                     Enable shell xtrace
-  -h                     Show this help
+  -u <username>              Configure user .xsession for the selected window manager
+  -y <keyboard layout>       Configure Xorg keyboard layout, e.g. us, br, de, br,us
+  -o <xdm|esxdm>             Display manager to build/configure; default: xdm
+  -o2 <afterstep|chiux>      Window manager to build/configure; default: afterstep
+  -v                         Enable shell xtrace
+  -h                         Show this help
 
 Environment:
-  PREFIX=/usr/local      Install prefix
-  WORKDIR=~/src/...      Build directory
-  JOBS=N                 Parallel build jobs for xdm and other builds
-  AFTERSTEP_JOBS=1       Parallel jobs for AfterStep; default is 1 for reliability
-  CLEAN_AFTERSTEP=1      Clean partial AfterStep build before rebuilding
-  START_XDM=1            Start selected display manager immediately after install
-  DISPLAY_MANAGER=xdm     Default display manager; xdm or esxdm
-  APK_TIMEOUT=240        Outer timeout in seconds for each apk operation
-  APK_NET_TIMEOUT=30     apk network timeout in seconds
-  GIT_TIMEOUT=300        Timeout in seconds for git clone/fetch/pull
-  XDM_CPP_WRAPPER=...    Override path for xdm cpp wrapper
-  XDM_TOOLKIT_FALLBACK=1 Enable xdm Xaw toolkit fallback when xaw7.pc is absent
-  BUILD_LIBXAW_IF_MISSING=1 Build libXaw from source if Xaw headers are absent
+  PREFIX=/usr/local          Install prefix
+  WORKDIR=~/src/...          Build directory
+  JOBS=N                     Parallel build jobs for xdm/esxdm/chiux and other builds
+  AFTERSTEP_JOBS=1           Parallel jobs for AfterStep; default is 1 for reliability
+  CLEAN_AFTERSTEP=1          Clean partial AfterStep build before rebuilding
+  START_XDM=1                Start selected display manager immediately after install
+  DISPLAY_MANAGER=xdm        Default display manager; xdm or esxdm
+  WINDOW_MANAGER=afterstep   Default window manager; afterstep or chiux
+  APK_TIMEOUT=240            Outer timeout in seconds for each apk operation
+  APK_NET_TIMEOUT=30         apk network timeout in seconds
+  GIT_TIMEOUT=300            Timeout in seconds for git clone/fetch/pull
+  CHIUX_REPO=...             Override chiux source repository
+  XDM_CPP_WRAPPER=...        Override path for xdm cpp wrapper
+  XDM_TOOLKIT_FALLBACK=1     Enable xdm Xaw toolkit fallback when xaw7.pc is absent
+  BUILD_LIBXAW_IF_MISSING=1  Build libXaw from source if Xaw headers are absent
   XDM_SKIP_CHOOSER_IF_NO_XAW=1 Skip xdm chooser if Xaw headers still cannot be provided
   DINIT_SERVICE_DIR=/etc/dinit.d Directory for local system dinit service files
   DINIT_BOOT_DIR=/etc/dinit.d/boot.d Directory for enabled boot symlinks
-  DINIT_XDM_SERVICE=xdm Service name to install/enable for xdm
-  DINIT_ESXDM_SERVICE=esxdm Service name to install/enable for esxdm
+  DINIT_XDM_SERVICE=xdm      Service name to install/enable for xdm
+  DINIT_ESXDM_SERVICE=esxdm  Service name to install/enable for esxdm
   ESXDM_PAM_DIR=/usr/lib/pam.d PAM config directory for esxdm
-  ESXDM_REPO=...        Override esxdm source repository
+  ESXDM_REPO=...             Override esxdm source repository
   DINIT_START_XDM_AFTER_ENABLE=1 Start xdm after enabling, independent of START_XDM
-  LIBXAW_REPO=...       Override libXaw source repository
-  TRACE=1                Same as -v
+  LIBXAW_REPO=...            Override libXaw source repository
+  TRACE=1                    Same as -v
 EOF
 }
 
 parse_args(){
-  while getopts ":u:y:o:vh" opt; do
-    case "$opt" in
-      u) USERNAME=$OPTARG ;;
-      y) KEYBOARD_LAYOUT=$OPTARG ;;
-      o) DISPLAY_MANAGER=$OPTARG ;;
-      v) TRACE=1 ;;
-      h) usage; exit 0 ;;
-      :) die "option -$OPTARG requires an argument" ;;
-      \?) die "unknown option: -$OPTARG" ;;
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -u)
+        [ $# -ge 2 ] || die "option -u requires an argument"
+        USERNAME=$2
+        shift 2
+        ;;
+      -y)
+        [ $# -ge 2 ] || die "option -y requires an argument"
+        KEYBOARD_LAYOUT=$2
+        shift 2
+        ;;
+      -o)
+        [ $# -ge 2 ] || die "option -o requires an argument"
+        DISPLAY_MANAGER=$2
+        shift 2
+        ;;
+      -o2)
+        [ $# -ge 2 ] || die "option -o2 requires an argument"
+        WINDOW_MANAGER=$2
+        shift 2
+        ;;
+      -v)
+        TRACE=1
+        shift
+        ;;
+      -h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
     esac
   done
 
@@ -115,8 +149,12 @@ parse_args(){
     xdm|esxdm) ;;
     *) die "invalid display manager for -o: $DISPLAY_MANAGER (expected xdm or esxdm)" ;;
   esac
-}
 
+  case "$WINDOW_MANAGER" in
+    afterstep|chiux) ;;
+    *) die "invalid window manager for -o2: $WINDOW_MANAGER (expected afterstep or chiux)" ;;
+  esac
+}
 init_logging(){
   mkdir -p "$WORKDIR"
   LOGFILE=${LOGFILE:-"${WORKDIR}/install-$(date '+%Y%m%d-%H%M%S').log"}
@@ -566,6 +604,29 @@ install_deps(){
     apk_add_pc_optional "esxdm Xft/fontconfig pkg-config providers"       xft       fontconfig
 
     apk_add_list optional "likely esxdm library/header package names"       libxft       fontconfig       pam       linux-pam       libpam
+  fi
+
+
+  if [ "$WINDOW_MANAGER" = chiux ]; then
+    apk_add_any_required "C++ compiler for chiux" \
+      cmd:c++ \
+      cmd:clang++ \
+      clang \
+      cxx
+
+    apk_add_any_required "CMake for chiux" \
+      cmd:cmake \
+      cmake
+
+    apk_add_pc_optional "chiux X11/PNG pkg-config providers" \
+      x11 \
+      libpng
+
+    apk_add_list optional "likely chiux library/header package names" \
+      libx11 \
+      libpng \
+      libpng-devel \
+      libpng-dev
   fi
 
   require_command git
@@ -1033,6 +1094,74 @@ configure_build_install(){
   configure_build_install_with_jobs "$JOBS" "$dir" "$@"
 }
 
+selected_wm_binary(){
+  case "$WINDOW_MANAGER" in
+    afterstep) printf '%s\n' "${PREFIX}/bin/afterstep" ;;
+    chiux) printf '%s\n' "${PREFIX}/bin/chiux" ;;
+    *) die "invalid window manager: $WINDOW_MANAGER" ;;
+  esac
+}
+
+selected_wm_label(){
+  case "$WINDOW_MANAGER" in
+    afterstep) printf '%s\n' AfterStep ;;
+    chiux) printf '%s\n' Chiux ;;
+    *) die "invalid window manager: $WINDOW_MANAGER" ;;
+  esac
+}
+
+selected_wm_desktop_id(){
+  case "$WINDOW_MANAGER" in
+    afterstep) printf '%s\n' afterstep ;;
+    chiux) printf '%s\n' chiux ;;
+    *) die "invalid window manager: $WINDOW_MANAGER" ;;
+  esac
+}
+
+write_selected_wm_desktop_file(){
+  local id name bin
+  id=$(selected_wm_desktop_id)
+  name=$(selected_wm_label)
+  bin=$(selected_wm_binary)
+
+  write_root "${PREFIX}/share/xsessions/${id}.desktop" 0644 <<EOF
+[Desktop Entry]
+Name=${name}
+Comment=${name} window manager
+Exec=${bin}
+Type=Application
+DesktopNames=${name}
+EOF
+}
+
+setup_chiux_user_config(){
+  [ "$WINDOW_MANAGER" = chiux ] || return 0
+  [ -n "$USERNAME" ] || return 0
+
+  local home group cfg_dir cfg_file src tmp
+  home=$(getent passwd "$USERNAME" | awk -F: '{print $6}')
+  group=$(id -gn "$USERNAME")
+  cfg_dir="${home}/.config/chiux"
+  cfg_file="${cfg_dir}/config.ini"
+  src="${PREFIX}/share/chiux/config.ini.example"
+
+  [ -r "$src" ] || {
+    warn "chiux default config not found: $src"
+    return 0
+  }
+
+  if [ -e "$cfg_file" ]; then
+    log "chiux user config already exists: $cfg_file"
+    return 0
+  fi
+
+  log "installing chiux user config: $cfg_file"
+  tmp=$(mktemp)
+  cat "$src" >"$tmp"
+  root install -D -o "$USERNAME" -g "$group" -m 0644 "$tmp" "$cfg_file"
+  rm -f "$tmp"
+}
+
 build_afterstep(){
   clone_or_update afterstep "$AFTERSTEP_REPO"
   patch_afterstep_for_chimera
@@ -1044,6 +1173,48 @@ build_afterstep(){
     --with-jpeg \
     --with-png
 }
+
+build_chiux(){
+  clone_or_update chiux "$CHIUX_REPO" "$CHIUX_REPO_FALLBACK"
+
+  local dir cxx
+  dir="${WORKDIR}/chiux"
+  cxx=$(first_command c++ clang++ g++ || true)
+
+  [ -n "$cxx" ] || die "no C++ compiler found for chiux"
+  command -v cmake >/dev/null 2>&1 || die "cmake not found for chiux"
+  [ -f "${dir}/CMakeLists.txt" ] || die "chiux CMakeLists.txt not found: ${dir}/CMakeLists.txt"
+
+  stage "building chiux"
+  cd "$dir"
+
+  run_cmd env CXX="$cxx" cmake \
+    -S "$dir" \
+    -B "${dir}/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$PREFIX"
+
+  run_cmd cmake --build "${dir}/build" -j "$JOBS"
+
+  [ -x "${dir}/build/chiux" ] || die "chiux binary was not built"
+  [ -x "${dir}/build/chiux-te" ] || warn "chiux-te binary was not built"
+
+  run_root_cmd install -D -m 0755 "${dir}/build/chiux" "${PREFIX}/bin/chiux"
+  if [ -x "${dir}/build/chiux-te" ]; then
+    run_root_cmd install -D -m 0755 "${dir}/build/chiux-te" "${PREFIX}/bin/chiux-te"
+  fi
+
+  if [ -r "${dir}/res/chimera.png" ]; then
+    run_root_cmd install -D -m 0644 "${dir}/res/chimera.png" "${PREFIX}/share/chiux/res/chimera.png"
+  fi
+
+  if [ -r "${dir}/res/config.ini" ]; then
+    run_root_cmd install -D -m 0644 "${dir}/res/config.ini" "${PREFIX}/share/chiux/config.ini.example"
+  else
+    warn "chiux default config not found in source: ${dir}/res/config.ini"
+  fi
+}
+
 
 prepare_xdm_cpp_wrapper(){
   stage "preparing xdm C preprocessor wrapper"
@@ -1439,7 +1610,7 @@ build_xdm(){
     --with-piddir=/run
     --with-authdir=/var/lib/xdm
     --with-default-vt=vt7
-    --with-default-session="${PREFIX}/bin/afterstep"
+    --with-default-session="$(selected_wm_binary)"
     --with-xrdb="$xrdb"
     --with-systemdsystemunitdir=no
     --with-systemd-daemon=no
@@ -1587,17 +1758,22 @@ setup_user_session(){
 
   stage "configuring user session"
 
-  local home group tmp
+  local home group tmp wm_bin wm_label
   home=$(getent passwd "$USERNAME" | awk -F: '{print $6}')
   group=$(id -gn "$USERNAME")
+  wm_bin=$(selected_wm_binary)
+  wm_label=$(selected_wm_label)
 
   [ -d "$home" ] || die "home directory does not exist for $USERNAME: $home"
+  [ -x "$wm_bin" ] || die "selected window manager is not executable: $wm_bin"
 
-  log "user=$USERNAME home=$home group=$group"
+  log "user=$USERNAME home=$home group=$group window_manager=$wm_label"
 
   add_user_to_group_if_present "$USERNAME" video
   add_user_to_group_if_present "$USERNAME" audio
   add_user_to_group_if_present "$USERNAME" input
+
+  setup_chiux_user_config
 
   backup_root "$home/.xsession"
 
@@ -1633,10 +1809,10 @@ if ! command -v dinitctl >/dev/null 2>&1; then
 fi
 
 if command -v dbus-run-session >/dev/null 2>&1; then
-    exec dbus-run-session ${PREFIX}/bin/afterstep
+    exec dbus-run-session ${wm_bin}
 fi
 
-exec ${PREFIX}/bin/afterstep
+exec ${wm_bin}
 EOF
 
   log "write: $home/.xsession"
@@ -1644,7 +1820,6 @@ EOF
 
   rm -f "$tmp"
 }
-
 install_video_drivers(){
   stage "checking video drivers"
 
@@ -1833,17 +2008,19 @@ dinit_remove_boot_link(){
 setup_xdm(){
   stage "configuring xdm"
 
-  local xserver xdm_bin service service_file env_file
+  local xserver xdm_bin service service_file env_file wm_bin
   xserver=$(first_command Xorg X || printf '%s\n' /usr/bin/Xorg)
   xdm_bin="${PREFIX}/bin/xdm"
   service="${DINIT_XDM_SERVICE:-xdm}"
   service_file="${DINIT_SERVICE_DIR}/${service}"
   env_file="/etc/X11/xdm/xdm-env"
+  wm_bin=$(selected_wm_binary)
 
   log "X server: $xserver"
   log "xdm binary: $xdm_bin"
   log "dinit service: $service"
   log "dinit service file: $service_file"
+  log "window manager binary: $wm_bin"
 
   run_root_cmd mkdir -p \
     /etc/X11/xdm \
@@ -1867,8 +2044,8 @@ if [ -r "\$HOME/.xsession" ]; then
     exec "\$HOME/.xsession"
 fi
 
-if [ -x "${PREFIX}/bin/afterstep" ]; then
-    exec "${PREFIX}/bin/afterstep"
+if [ -x "${wm_bin}" ]; then
+    exec "${wm_bin}"
 fi
 
 if command -v xterm >/dev/null 2>&1; then
@@ -1878,14 +2055,7 @@ fi
 exec /bin/sh -l
 EOF
 
-  write_root "${PREFIX}/share/xsessions/afterstep.desktop" 0644 <<EOF
-[Desktop Entry]
-Name=AfterStep
-Comment=AfterStep window manager
-Exec=${PREFIX}/bin/afterstep
-Type=Application
-DesktopNames=AfterStep
-EOF
+  write_selected_wm_desktop_file
 
   # Keep runtime library and executable paths explicit for locally built X11 bits.
   write_root "$env_file" 0644 <<EOF
@@ -1963,15 +2133,7 @@ setup_esxdm(){
 
   run_root_cmd mkdir -p     /etc/esxdm     /var/log     "${PREFIX}/share/xsessions"     "$DINIT_SERVICE_DIR"     "$DINIT_BOOT_DIR"     "$ESXDM_PAM_DIR"
 
-  write_root "${PREFIX}/share/xsessions/afterstep.desktop" 0644 <<EOF
-[Desktop Entry]
-Name=AfterStep
-Comment=AfterStep window manager
-Exec=${PREFIX}/bin/afterstep
-Type=Application
-DesktopNames=AfterStep
-EOF
-
+  write_selected_wm_desktop_file
   write_root "$env_file" 0644 <<EOF
 PATH=/bin:/usr/bin:/usr/local/bin:${PREFIX}/bin
 LD_LIBRARY_PATH=${PREFIX}/lib:/usr/local/lib:/usr/lib:/lib
@@ -2053,12 +2215,24 @@ validate(){
   stage "validating install"
 
   local ok=1
+  local wm_bin wm_label wm_id
+  wm_bin=$(selected_wm_binary)
+  wm_label=$(selected_wm_label)
+  wm_id=$(selected_wm_desktop_id)
 
-  [ -x "${PREFIX}/bin/afterstep" ] || {
-    warn "missing executable: ${PREFIX}/bin/afterstep"
+  [ -x "$wm_bin" ] || {
+    warn "missing selected window manager executable: $wm_bin"
     ok=0
   }
 
+  [ -r "${PREFIX}/share/xsessions/${wm_id}.desktop" ] || {
+    warn "missing desktop session file for $wm_label: ${PREFIX}/share/xsessions/${wm_id}.desktop"
+    ok=0
+  }
+
+  if [ "$WINDOW_MANAGER" = chiux ] && [ ! -x "${PREFIX}/bin/chiux-te" ]; then
+    warn "missing optional chiux terminal executable: ${PREFIX}/bin/chiux-te"
+  fi
   if [ "$DISPLAY_MANAGER" = esxdm ]; then
     local esxdm_service esxdm_pam
     esxdm_service="${DINIT_ESXDM_SERVICE:-esxdm}"
@@ -2117,6 +2291,11 @@ validate(){
       warn "missing or non-executable user session: $home/.xsession"
       ok=0
     }
+
+    if [ "$WINDOW_MANAGER" = chiux ] && [ ! -r "$home/.config/chiux/config.ini" ]; then
+      warn "missing chiux user config: $home/.config/chiux/config.ini"
+      ok=0
+    fi
   fi
 
   [ -e /dev/dri/card0 ] || warn "no /dev/dri/card0; kernel DRM or GPU driver may be missing"
@@ -2141,10 +2320,18 @@ main(){
   init_logging
   detect_os
   log "selected display manager: $DISPLAY_MANAGER"
+  log "selected window manager: $WINDOW_MANAGER"
   setup_privilege
   install_deps
   install_video_drivers
-  build_afterstep
+  case "$WINDOW_MANAGER" in
+    afterstep)
+      build_afterstep
+      ;;
+    chiux)
+      build_chiux
+      ;;
+  esac
 
   case "$DISPLAY_MANAGER" in
     xdm)
